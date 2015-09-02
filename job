@@ -1,0 +1,169 @@
+#!/usr/bin/env ruby
+require 'wuparty'                           
+require 'yaml'                              
+require 'sosjobdsl'                         
+                                            
+ACCOUNT = 'amdirent'                        # Configure wufoo credentials
+API_KEY = 'ZCIS-5CD3-62A9-VMZV'
+FORM_ID = 'job-scheduler'
+ENTRIES  = '/home/crankin/jobs/ruby/process_wufoo_job_submissions/entries.yaml'
+JOB_FLDR = '/home/crankin/' +
+  'sos-berlin.com/jobscheduler/' +
+  'crankin-desktop_4444/' +
+  'config/live/'
+
+
+$configured_jobs = []
+
+def convert_weekdays(x)
+  list = ""
+  days = {
+    "monday"    => 1,
+    "tuesday"   => 2,
+    "wednesday" => 3,
+    "thursday"  => 4,
+    "friday"    => 5,
+    "saturday"  => 6,
+    "sunday"    => 7
+  }
+
+  x.split("\r\n").each do |d|
+    list << "#{days[d.downcase]} "
+  end
+
+  return list.rstrip
+end
+
+def configure_params(e)
+  params = ''
+  case e['Field2'].downcase
+  when 'sms'
+    params << "-t \"#{e['Field228']}\" -d #{e['Field232']} -q \"#{e['Field109']}\""
+  end
+  return params
+end
+
+def configure_job(e)
+  puts "Configuring job: #{e["EntryId"]}"
+
+  job_path = {
+    "sms" => 
+      "/home/crankin/jobs/ruby/send_sms/job",
+    "email" => 
+      "/home/crankin/jobs/ruby/send_email/job"
+  }
+
+  j = Sosjobdsl::Job.new(e['Field1']) {} 
+  j.setting :mail_on_success, "yes"
+  j.setting :log_mail_to, "crankin@pangeare.com"
+  j.execute :file => job_path[e["Field2"].downcase], :param => configure_params(e) 
+
+  schedule_hash = {:once => "yes"}
+  schedule_hash[:begin] = e['Field112'] unless e['Field112'].empty?
+  schedule_hash[:end] = e['Field113'] unless e['Field113'].empty? 
+  schedule_hash[:repeat] = e['Field122'] unless e['Field122'].empty?
+
+  # TODO: Exit script and send error to user if both begin time and end time
+  # are not both set.
+  #
+  # TODO: Send error to user if repeat time doesn't match the pattern hh:mm:ss
+  # 
+  
+  j.schedule(schedule_hash) {}
+
+  unless e["Field116"].empty?
+    e["Field116"]
+    .split("\r\n").each do |d|
+      j.day d
+    end
+  end
+
+  j.weekday convert_weekdays(e[
+    "Field117"
+  ]) unless e["Field117"].empty?
+
+  unless e["Field118"].empty?
+    e["Field118"]
+    .split("\r\n").each do |d|
+      if (d =~ /[a-z]/) != nil
+        args = d.split(' ')
+        j.monthday args[0], args[1]
+      else
+        j.monthday d
+      end
+    end
+  end 
+
+  unless e["Field119"].empty? 
+    e["Field119"]             
+    .split("\r\n").each do |d|
+      j.holiday d    
+    end                       
+  end                         
+
+  $configured_jobs.push(j)
+end 
+
+begin
+  entries = YAML.load_file(ENTRIES)         # Load in existing jobs list
+  entries = {} if !entries
+rescue 
+  entries = {}
+end
+
+file = File.open(ENTRIES, 'w+')             # Create entries database if it 
+                                            # doesn't exists.
+
+
+
+wufoo = WuParty.new(ACCOUNT, API_KEY)       # Connect to Wufoo API
+
+form = wufoo.form(FORM_ID)                  # Get the job scheduler form
+
+if entries.empty?                           # If the entries database doesn't
+  downloaded = {}                           # exist yet. Then add all entries
+  form.entries.each do |e|                  # to it.
+    downloaded[e["EntryId"]] = e
+    configure_job(e)
+  end
+  entries = downloaded
+end
+
+form.entries.each do |e|                
+  if entries[e["EntryId"]].nil?             # If the form entry doesn't exists
+    entries[e["EntryId"]] = e               # in our database then add it.
+    puts "Saved Entry: #{e["EntryId"]}"
+    configure_job(e)
+  end
+
+  x = entries[e["EntryId"]]
+
+  if entries[e["EntryId"]]\
+    ["DateUpdated"] != e["DateUpdated"]     # Something changed let's update it
+                                            # and save the diff.
+    
+    configure_job(e)
+    entries[e["EntryId"]] = e
+  end
+end                                         
+
+file.write(entries.to_yaml)                 # Save the databae and close it.
+file.close
+
+$configured_jobs.each do |job|
+  begin
+    f = File.open(                            # Open file in live folder and 
+      JOB_FLDR +                              # write the xml content.
+      job.job[:name].to_s +
+      '.job.xml',         
+      'w+'            
+    ) 
+    f.write(job.to_xml.to_s)
+    f.close
+  rescue Exception => e
+    puts e.inspect
+    exit 1
+  end
+end
+
+exit 0
